@@ -1,0 +1,11 @@
+IT Guide: VPN and Remote Access
+
+When you need the VPN. The company VPN is required to reach internal systems such as the staging environment, the internal wiki and the finance system. Email, chat and the HR portal are available without the VPN.
+
+Setting up the VPN. Install the BrightGate client from the Software Center on your company laptop. Sign in with your company email and approve the login request in the Authenticator app on your phone. Select the gateway named EU-Central; the gateway US-East is only for employees travelling to the United States.
+
+Common problems. If the VPN connects but internal sites do not open, disconnect and reconnect, then flush the DNS cache. If the client shows the error AUTH-403, your account has no VPN permission yet: open a ticket in the IT Service Desk with the category Access and ask for the VPN-Standard role. Granting the role takes up to 1 working day.
+
+Personal devices. The VPN may not be installed on personal devices. Employees who need access from a private computer must use the browser-based remote desktop at remote.brightwave.example, which also requires the Authenticator app.
+
+Security rules. Never share your VPN credentials. If you lose the phone with the Authenticator app, report it to the IT Service Desk immediately by calling the 24/7 line, internal number 4000, so the access can be blocked.

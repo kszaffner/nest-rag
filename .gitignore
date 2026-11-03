@@ -33,5 +33,5 @@ npm-debug.log*
 # local embedding model cache (downloaded by @xenova/transformers)
 .cache/
 
-# tutorial/conversation log - local reference only, not part of the repo
+# local reference only, not part of the repo
 doc.md
