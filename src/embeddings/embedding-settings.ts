@@ -1,3 +1,8 @@
+import {
+  parseBooleanSetting,
+  readTrimmedValue,
+} from '../config/setting-parsers.js';
+
 export const EMBEDDING_PROVIDER_KINDS = ['mock', 'transformers'] as const;
 export type EmbeddingProviderKind = (typeof EMBEDDING_PROVIDER_KINDS)[number];
 
@@ -18,9 +23,6 @@ export interface EmbeddingSettings {
   modelRevision?: string;
 }
 
-const TRUE_TEXT = 'true';
-const FALSE_TEXT = 'false';
-
 /**
  * Reads and validates the embedding configuration. Throws on an invalid
  * value, so a typo stops the application at startup instead of silently
@@ -32,13 +34,13 @@ export function parseEmbeddingSettings(
   const providerKind = parseProviderKind(
     readValue(EMBEDDING_ENVIRONMENT_KEYS.providerKind),
   );
-  const localFilesOnly = parseBoolean(
+  const localFilesOnly = parseBooleanSetting(
     EMBEDDING_ENVIRONMENT_KEYS.localFilesOnly,
     readValue(EMBEDDING_ENVIRONMENT_KEYS.localFilesOnly),
   );
-  const modelRevision = readValue(
-    EMBEDDING_ENVIRONMENT_KEYS.modelRevision,
-  )?.trim();
+  const modelRevision = readTrimmedValue(
+    readValue(EMBEDDING_ENVIRONMENT_KEYS.modelRevision),
+  );
 
   return {
     providerKind,
@@ -63,18 +65,4 @@ function parseProviderKind(
     );
   }
   return matchingKind;
-}
-
-function parseBoolean(key: string, rawValue: string | undefined): boolean {
-  const trimmedValue = rawValue?.trim();
-  if (!trimmedValue) {
-    return false;
-  }
-  if (trimmedValue === TRUE_TEXT) {
-    return true;
-  }
-  if (trimmedValue === FALSE_TEXT) {
-    return false;
-  }
-  throw new Error(`${key} must be "${TRUE_TEXT}" or "${FALSE_TEXT}"`);
 }

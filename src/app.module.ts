@@ -5,6 +5,8 @@ import { AppService } from './app.service.js';
 import { DocumentsModule } from './documents/documents.module.js';
 import { EmbeddingsModule } from './embeddings/embeddings.module.js';
 import { IndexingModule } from './indexing/indexing.module.js';
+import { LlmModule } from './llm/llm.module.js';
+import { RagModule } from './rag/rag.module.js';
 
 @Module({
   imports: [
@@ -14,6 +16,8 @@ import { IndexingModule } from './indexing/indexing.module.js';
     DocumentsModule,
     EmbeddingsModule,
     IndexingModule,
+    LlmModule,
+    RagModule,
   ],
   controllers: [AppController],
   providers: [AppService],

@@ -30,6 +30,11 @@ interface SearchCandidate extends SearchResult {
  * comparing the query with every stored embedding. Simple and exact, and
  * fast enough for thousands of chunks. Everything is lost when the application
  * stops. Replace it with a database-backed VectorStore for larger data.
+ *
+ * Planned migration: a SQLite store (with the sqlite-vec extension) that
+ * implements the same VectorStore interface. Only the factory in
+ * VectorStoreModule changes; see also StartupIndexer, which rebuilds the
+ * index on every start only because this store is not persistent.
  */
 export class InMemoryVectorStore implements VectorStore {
   private readonly dimensions: number;
