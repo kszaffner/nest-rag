@@ -5,6 +5,7 @@ import {
 } from '../embeddings/embedding-provider.interface.js';
 import { estimateCostInUsd } from '../llm/claude-pricing.js';
 import { MAX_USER_MESSAGE_LENGTH_IN_CHARACTERS } from '../llm/llm-input-limits.js';
+import { streamFromProvider } from '../llm/llm-stream.js';
 import {
   LLM_PROVIDER,
   type ContextPassage,
@@ -48,6 +49,12 @@ export interface RagAnswer {
   wasTruncated: boolean;
 }
 
+/** What `streamAnswer` produces: the sources, then the answer piece by piece, then the totals. */
+export type RagStreamEvent =
+  | { type: 'sources'; sources: RagSource[] }
+  | { type: 'delta'; text: string }
+  | ({ type: 'done' } & Omit<RagAnswer, 'answer' | 'sources'>);
+
 /**
  * The RAG pipeline: question -> embedding -> search -> prompt -> model.
  * It never logs the question or the answer, because they may be private.
@@ -68,16 +75,7 @@ export class RagService {
     this.assertValidQuestion(question);
     const trimmedQuestion = question.trim();
 
-    const questionEmbedding =
-      await this.embeddingProvider.embed(trimmedQuestion);
-    const searchResults = await this.vectorStore.search(questionEmbedding, {
-      topK: RETRIEVED_CHUNK_COUNT,
-    });
-    const sources: RagSource[] = searchResults.map((result) => ({
-      sourceId: createChunkId(result.chunk),
-      similarity: result.similarity,
-      text: result.chunk.text,
-    }));
+    const sources = await this.retrieveSources(trimmedQuestion);
 
     // Nothing to answer from: skip the model call, so it costs nothing and
     // cannot make something up.
@@ -113,6 +111,65 @@ export class RagService {
       ...(estimatedCostInUsd !== undefined && { estimatedCostInUsd }),
       wasTruncated: response.wasTruncated ?? false,
     };
+  }
+
+  /**
+   * Same as `answerQuestion`, but the answer arrives piece by piece. The
+   * first event is always "sources", the last one is always "done". The
+   * question is checked when the first event is requested.
+   */
+  async *streamAnswer(question: string): AsyncGenerator<RagStreamEvent> {
+    this.assertValidQuestion(question);
+    const trimmedQuestion = question.trim();
+
+    const sources = await this.retrieveSources(trimmedQuestion);
+    yield { type: 'sources', sources };
+
+    if (sources.length === 0) {
+      yield { type: 'delta', text: NO_ANSWER_TEXT };
+      yield {
+        type: 'done',
+        usage: { inputTokens: NO_TOKENS_USED, outputTokens: NO_TOKENS_USED },
+        estimatedCostInUsd: NO_COST_IN_USD,
+        wasTruncated: false,
+      };
+      return;
+    }
+
+    const context: ContextPassage[] = sources.map(({ sourceId, text }) => ({
+      sourceId,
+      text,
+    }));
+    for await (const event of streamFromProvider(this.llmProvider, {
+      systemPrompt: RAG_SYSTEM_PROMPT,
+      userMessage: trimmedQuestion,
+      context,
+    })) {
+      if (event.type === 'delta') {
+        yield event;
+        continue;
+      }
+      const estimatedCostInUsd = estimateCostInUsd(event.model, event.usage);
+      yield {
+        type: 'done',
+        model: event.model,
+        usage: event.usage,
+        ...(estimatedCostInUsd !== undefined && { estimatedCostInUsd }),
+        wasTruncated: event.wasTruncated ?? false,
+      };
+    }
+  }
+
+  private async retrieveSources(question: string): Promise<RagSource[]> {
+    const questionEmbedding = await this.embeddingProvider.embed(question);
+    const searchResults = await this.vectorStore.search(questionEmbedding, {
+      topK: RETRIEVED_CHUNK_COUNT,
+    });
+    return searchResults.map((result) => ({
+      sourceId: createChunkId(result.chunk),
+      similarity: result.similarity,
+      text: result.chunk.text,
+    }));
   }
 
   /** Error messages name the problem, never the content of the question. */

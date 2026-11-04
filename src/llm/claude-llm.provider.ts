@@ -5,6 +5,7 @@ import type {
   LlmGenerationRequest,
   LlmProvider,
   LlmResponse,
+  LlmStreamEvent,
 } from './llm-provider.interface.js';
 
 /** The cheapest current model. Change it with the CLAUDE_MODEL setting. */
@@ -26,6 +27,7 @@ export const DEFAULT_CLAUDE_MAX_RETRIES = 2;
 const ANSWER_EFFORT = 'low';
 
 const MINIMUM_OUTPUT_TOKENS = 1;
+const NO_TOKENS_REPORTED = 0;
 const STOP_REASON_REFUSAL = 'refusal';
 const STOP_REASON_MAX_TOKENS = 'max_tokens';
 
@@ -34,11 +36,19 @@ export interface ClaudeLlmOptions {
   maxOutputTokens: number;
 }
 
+/** Events of a streamed answer. `controller.abort()` closes the connection. */
+export interface ClaudeEventStream extends AsyncIterable<Anthropic.RawMessageStreamEvent> {
+  controller: { abort(): void };
+}
+
 /** The only part of the SDK client that this provider needs. */
 export interface ClaudeMessagesApi {
   create(
     parameters: Anthropic.MessageCreateParamsNonStreaming,
   ): Promise<Anthropic.Message>;
+  createStream(
+    parameters: Anthropic.MessageCreateParamsStreaming,
+  ): Promise<ClaudeEventStream>;
 }
 
 export interface ClaudeClientSettings {
@@ -62,7 +72,10 @@ export function createClaudeMessagesApi(
       DEFAULT_CLAUDE_REQUEST_TIMEOUT_IN_MILLISECONDS,
     maxRetries: settings.maxRetries ?? DEFAULT_CLAUDE_MAX_RETRIES,
   });
-  return client.messages;
+  return {
+    create: (parameters) => client.messages.create(parameters),
+    createStream: (parameters) => client.messages.create(parameters),
+  };
 }
 
 /**
@@ -88,17 +101,9 @@ export class ClaudeLlmProvider implements LlmProvider {
   async generate(request: LlmGenerationRequest): Promise<LlmResponse> {
     assertValidGenerationRequest(request);
 
-    // Sampling parameters (temperature, top_p, top_k) are left out on
-    // purpose: the API rejects them.
     let message: Anthropic.Message;
     try {
-      message = await this.messagesApi.create({
-        model: this.options.model,
-        max_tokens: this.options.maxOutputTokens,
-        system: request.systemPrompt,
-        output_config: { effort: ANSWER_EFFORT },
-        messages: [{ role: 'user', content: buildUserPrompt(request) }],
-      });
+      message = await this.messagesApi.create(this.createParameters(request));
     } catch (error) {
       throw toSafeError(error);
     }
@@ -115,6 +120,79 @@ export class ClaudeLlmProvider implements LlmProvider {
         outputTokens: message.usage.output_tokens,
       },
       wasTruncated: message.stop_reason === STOP_REASON_MAX_TOKENS,
+    };
+  }
+
+  /**
+   * Streams the answer as Claude writes it. The connection is closed as soon
+   * as the caller stops reading, so a page that was closed does not keep
+   * costing money.
+   */
+  async *stream(request: LlmGenerationRequest): AsyncGenerator<LlmStreamEvent> {
+    assertValidGenerationRequest(request);
+
+    let events: ClaudeEventStream;
+    try {
+      events = await this.messagesApi.createStream({
+        ...this.createParameters(request),
+        stream: true,
+      });
+    } catch (error) {
+      throw toSafeError(error);
+    }
+
+    let model = this.options.model;
+    let inputTokens = NO_TOKENS_REPORTED;
+    let outputTokens = NO_TOKENS_REPORTED;
+    let stopReason: Anthropic.StopReason | null = null;
+
+    try {
+      for await (const event of events) {
+        if (event.type === 'message_start') {
+          model = event.message.model;
+          inputTokens = event.message.usage.input_tokens;
+        } else if (
+          event.type === 'content_block_delta' &&
+          event.delta.type === 'text_delta'
+        ) {
+          yield { type: 'delta', text: event.delta.text };
+        } else if (event.type === 'message_delta') {
+          stopReason = event.delta.stop_reason;
+          outputTokens = event.usage.output_tokens;
+          inputTokens = event.usage.input_tokens ?? inputTokens;
+        }
+      }
+    } catch (error) {
+      throw toSafeError(error);
+    } finally {
+      events.controller.abort();
+    }
+
+    if (stopReason === STOP_REASON_REFUSAL) {
+      throw new Error('The model declined to answer this request');
+    }
+    if (stopReason === null) {
+      throw new Error('Claude stream ended before the answer was complete');
+    }
+    yield {
+      type: 'end',
+      model,
+      usage: { inputTokens, outputTokens },
+      wasTruncated: stopReason === STOP_REASON_MAX_TOKENS,
+    };
+  }
+
+  private createParameters(
+    request: LlmGenerationRequest,
+  ): Anthropic.MessageCreateParamsNonStreaming {
+    // Sampling parameters (temperature, top_p, top_k) are left out on
+    // purpose: the API rejects them.
+    return {
+      model: this.options.model,
+      max_tokens: this.options.maxOutputTokens,
+      system: request.systemPrompt,
+      output_config: { effort: ANSWER_EFFORT },
+      messages: [{ role: 'user', content: buildUserPrompt(request) }],
     };
   }
 }

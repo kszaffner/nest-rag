@@ -29,8 +29,25 @@ export interface LlmResponse {
   wasTruncated?: boolean;
 }
 
+/** A piece of an answer that is being produced, or the end of the answer. */
+export type LlmStreamEvent =
+  | { type: 'delta'; text: string }
+  | {
+      type: 'end';
+      model: string;
+      usage: TokenUsage;
+      wasTruncated?: boolean;
+    };
+
 export interface LlmProvider {
   generate(request: LlmGenerationRequest): Promise<LlmResponse>;
+
+  /**
+   * Optional. Produces the answer piece by piece, so it can be shown while it
+   * is being written. It yields any number of "delta" events and then exactly
+   * one "end" event. Providers without it are used through `streamFromProvider`.
+   */
+  stream?(request: LlmGenerationRequest): AsyncIterable<LlmStreamEvent>;
 }
 
 /** Dependency injection token used to inject the configured provider. */

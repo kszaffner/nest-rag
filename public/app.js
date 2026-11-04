@@ -87,15 +87,60 @@ function renderSources(sources) {
   }
 }
 
-function renderResult(data) {
-  answer.textContent = data.answer;
-  warning.hidden = !data.wasTruncated;
-  warning.textContent = data.wasTruncated
-    ? 'The answer was cut off at the length limit.'
-    : '';
-  details.textContent = formatDetails(data);
-  renderSources(Array.isArray(data.sources) ? data.sources : []);
-  result.hidden = false;
+/** Shows what arrives from the stream, one event at a time. */
+function handleStreamEvent(eventName, data) {
+  switch (eventName) {
+    case 'sources':
+      answer.textContent = '';
+      warning.hidden = true;
+      details.textContent = '';
+      renderSources(Array.isArray(data.sources) ? data.sources : []);
+      result.hidden = false;
+      showStatus('Writing the answer...', false);
+      break;
+    case 'delta':
+      answer.textContent += data.text;
+      break;
+    case 'done':
+      warning.hidden = !data.wasTruncated;
+      warning.textContent = data.wasTruncated
+        ? 'The answer was cut off at the length limit.'
+        : '';
+      details.textContent = formatDetails(data);
+      showStatus('', false);
+      break;
+    case 'error':
+      showStatus('The answer could not be generated. Try again later.', true);
+      break;
+    default:
+      break;
+  }
+}
+
+/**
+ * Splits the text received so far into complete events (they end with an
+ * empty line) and returns the rest, which is the beginning of the next one.
+ */
+function readEvents(buffer, onEvent) {
+  const parts = buffer.split('\n\n');
+  const unfinishedPart = parts.pop();
+  for (const part of parts) {
+    let eventName = 'message';
+    let dataText = '';
+    for (const line of part.split('\n')) {
+      if (line.startsWith('event: ')) {
+        eventName = line.slice('event: '.length);
+      } else if (line.startsWith('data: ')) {
+        dataText += line.slice('data: '.length);
+      }
+    }
+    try {
+      onEvent(eventName, JSON.parse(dataText));
+    } catch {
+      // An event that is not valid JSON is ignored.
+    }
+  }
+  return unfinishedPart;
 }
 
 async function ask(question) {
@@ -104,17 +149,29 @@ async function ask(question) {
   showStatus('Searching the documents...', false);
 
   try {
-    const response = await fetch('/rag/query', {
+    const response = await fetch('/rag/query/stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ question }),
     });
-    if (!response.ok) {
+    if (!response.ok || !response.body) {
       showStatus(describeFailure(response), true);
       return;
     }
-    renderResult(await response.json());
-    showStatus('', false);
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      buffer = readEvents(
+        buffer + decoder.decode(value, { stream: true }),
+        handleStreamEvent,
+      );
+    }
   } catch {
     showStatus('Cannot reach the server. Check your connection.', true);
   } finally {

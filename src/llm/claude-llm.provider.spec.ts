@@ -38,12 +38,15 @@ function createMessage(
 }
 
 function createMessagesApiReturning(message: Anthropic.Message) {
-  return { create: vi.fn(async () => message) };
+  return { create: vi.fn(async () => message), createStream: vi.fn() };
 }
 
 function createMessagesApiFailingWith(error: unknown) {
   return {
     create: vi.fn(async () => {
+      throw error;
+    }),
+    createStream: vi.fn(async () => {
       throw error;
     }),
   } satisfies ClaudeMessagesApi;
@@ -319,6 +322,197 @@ describe('ClaudeLlmProvider', () => {
       const api = createClaudeMessagesApi({ apiKey: 'sk-ant-test-not-real' });
 
       expect(typeof api.create).toBe('function');
+    });
+  });
+
+  describe('stream', () => {
+    const startEvent = {
+      type: 'message_start',
+      message: createMessage({
+        usage: { input_tokens: 150, output_tokens: 1 },
+      } as never),
+    };
+    const textEvent = (text: string) => ({
+      type: 'content_block_delta',
+      index: 0,
+      delta: { type: 'text_delta', text },
+    });
+    const endEvent = (stopReason: string, outputTokens = 12) => ({
+      type: 'message_delta',
+      delta: { stop_reason: stopReason, stop_sequence: null },
+      usage: { output_tokens: outputTokens },
+    });
+
+    function createStreamingApi(events: unknown[], failWith?: unknown) {
+      const abort = vi.fn();
+      const createStream = vi.fn(async () => ({
+        controller: { abort },
+        async *[Symbol.asyncIterator]() {
+          for (const event of events) {
+            yield event;
+          }
+          if (failWith) {
+            throw failWith;
+          }
+        },
+      }));
+      return {
+        abort,
+        messagesApi: {
+          create: vi.fn(),
+          createStream,
+        } as unknown as ClaudeMessagesApi,
+        createStream,
+      };
+    }
+
+    async function collect(provider: ClaudeLlmProvider) {
+      const events = [];
+      for await (const event of provider.stream(createRequest())) {
+        events.push(event);
+      }
+      return events;
+    }
+
+    it('yields the text pieces and then the totals', async () => {
+      const { messagesApi } = createStreamingApi([
+        startEvent,
+        textEvent('You '),
+        {
+          type: 'content_block_delta',
+          index: 0,
+          delta: { type: 'thinking_delta', thinking: 'hidden' },
+        },
+        textEvent('have 26 days.'),
+        endEvent('end_turn'),
+        { type: 'message_stop' },
+      ]);
+
+      const events = await collect(new ClaudeLlmProvider(messagesApi));
+
+      expect(events).toEqual([
+        { type: 'delta', text: 'You ' },
+        { type: 'delta', text: 'have 26 days.' },
+        {
+          type: 'end',
+          model: 'claude-haiku-5-5',
+          usage: { inputTokens: 150, outputTokens: 12 },
+          wasTruncated: false,
+        },
+      ]);
+    });
+
+    it('sends the same request as generate, with stream turned on', async () => {
+      const { messagesApi, createStream } = createStreamingApi([
+        startEvent,
+        endEvent('end_turn'),
+      ]);
+
+      await collect(new ClaudeLlmProvider(messagesApi));
+
+      const [parameters] = createStream.mock.calls[0] as unknown as [
+        Record<string, unknown>,
+      ];
+      expect(parameters).toMatchObject({
+        model: DEFAULT_CLAUDE_MODEL,
+        max_tokens: DEFAULT_CLAUDE_MAX_OUTPUT_TOKENS,
+        output_config: { effort: 'low' },
+        stream: true,
+      });
+      expect(parameters).not.toHaveProperty('temperature');
+    });
+
+    it('marks an answer that reached the output limit', async () => {
+      const { messagesApi } = createStreamingApi([
+        startEvent,
+        textEvent('Cut'),
+        endEvent('max_tokens'),
+      ]);
+
+      const events = await collect(new ClaudeLlmProvider(messagesApi));
+
+      expect(events.at(-1)).toMatchObject({ type: 'end', wasTruncated: true });
+    });
+
+    it('fails on a refusal', async () => {
+      const { messagesApi } = createStreamingApi([
+        startEvent,
+        endEvent('refusal'),
+      ]);
+
+      await expect(collect(new ClaudeLlmProvider(messagesApi))).rejects.toThrow(
+        'declined',
+      );
+    });
+
+    it('fails when the stream ends before the answer is complete', async () => {
+      const { messagesApi } = createStreamingApi([
+        startEvent,
+        textEvent('Half'),
+      ]);
+
+      await expect(collect(new ClaudeLlmProvider(messagesApi))).rejects.toThrow(
+        'ended before the answer was complete',
+      );
+    });
+
+    it('hides the text of an error that happens in the middle', async () => {
+      const { messagesApi } = createStreamingApi(
+        [startEvent, textEvent('One ')],
+        new Anthropic.RateLimitError(
+          429,
+          { message: SECRET_TEXT_IN_ERROR },
+          SECRET_TEXT_IN_ERROR,
+          new Headers(),
+        ),
+      );
+
+      const result = collect(new ClaudeLlmProvider(messagesApi));
+
+      await expect(result).rejects.toThrow('rate limit');
+      await expect(result).rejects.not.toThrow(SECRET_TEXT_IN_ERROR);
+    });
+
+    it('hides the text of an error that happens when the stream is opened', async () => {
+      const messagesApi = createMessagesApiFailingWith(
+        new Anthropic.AuthenticationError(
+          401,
+          { message: SECRET_TEXT_IN_ERROR },
+          SECRET_TEXT_IN_ERROR,
+          new Headers(),
+        ),
+      );
+
+      const result = collect(new ClaudeLlmProvider(messagesApi));
+
+      await expect(result).rejects.toThrow('rejected the credentials');
+      await expect(result).rejects.not.toThrow(SECRET_TEXT_IN_ERROR);
+    });
+
+    it('closes the connection when the caller stops early', async () => {
+      const { messagesApi, abort } = createStreamingApi([
+        startEvent,
+        textEvent('One '),
+        textEvent('Two '),
+        endEvent('end_turn'),
+      ]);
+
+      const events = new ClaudeLlmProvider(messagesApi).stream(createRequest());
+      await events.next();
+      await events.return(undefined);
+
+      expect(abort).toHaveBeenCalled();
+    });
+
+    it('validates the request before any network call', async () => {
+      const { messagesApi, createStream } = createStreamingApi([]);
+
+      await expect(
+        new ClaudeLlmProvider(messagesApi)
+          .stream({ ...createRequest(), userMessage: ' ' })
+          .next(),
+      ).rejects.toThrow(RangeError);
+      expect(createStream).not.toHaveBeenCalled();
     });
   });
 });

@@ -414,4 +414,181 @@ describe('OllamaLlmProvider', () => {
       ).toThrow(RangeError);
     });
   });
+
+  describe('stream', () => {
+    function createNdjsonResponse(lines: unknown[], status = 200): Response {
+      return new Response(
+        lines.map((line) => JSON.stringify(line)).join('\n') + '\n',
+        {
+          status,
+          headers: { 'Content-Type': 'application/x-ndjson' },
+        },
+      );
+    }
+
+    const piece = (content: string) => ({
+      model: 'llama3.2:1b',
+      message: { role: 'assistant', content },
+      done: false,
+    });
+    const last = {
+      model: 'llama3.2:1b',
+      message: { role: 'assistant', content: '' },
+      done: true,
+      done_reason: 'stop',
+      prompt_eval_count: 120,
+      eval_count: 8,
+    };
+
+    async function collect(provider: OllamaLlmProvider) {
+      const events = [];
+      for await (const event of provider.stream(createRequest())) {
+        events.push(event);
+      }
+      return events;
+    }
+
+    it('asks Ollama for a stream and yields the pieces and the end', async () => {
+      const fetchMock = createFetchReturning(
+        createNdjsonResponse([
+          piece('You '),
+          piece('have '),
+          piece('26.'),
+          last,
+        ]),
+      );
+
+      const events = await collect(new OllamaLlmProvider({}, fetchMock));
+
+      expect(readSentBody(fetchMock).stream).toBe(true);
+      expect(events).toEqual([
+        { type: 'delta', text: 'You ' },
+        { type: 'delta', text: 'have ' },
+        { type: 'delta', text: '26.' },
+        {
+          type: 'end',
+          model: 'llama3.2:1b',
+          usage: { inputTokens: 120, outputTokens: 8 },
+          wasTruncated: false,
+        },
+      ]);
+    });
+
+    it('marks an answer that was cut off by the output limit', async () => {
+      const fetchMock = createFetchReturning(
+        createNdjsonResponse([
+          piece('Cut'),
+          { ...last, done_reason: 'length' },
+        ]),
+      );
+
+      const events = await collect(new OllamaLlmProvider({}, fetchMock));
+
+      expect(events.at(-1)).toMatchObject({ type: 'end', wasTruncated: true });
+    });
+
+    it('joins a line that arrives in several network chunks', async () => {
+      const encoder = new TextEncoder();
+      const wholeText =
+        JSON.stringify(piece('Hello')) + '\n' + JSON.stringify(last) + '\n';
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode(wholeText.slice(0, 20)));
+          controller.enqueue(encoder.encode(wholeText.slice(20, 70)));
+          controller.enqueue(encoder.encode(wholeText.slice(70)));
+          controller.close();
+        },
+      });
+      const fetchMock = createFetchReturning(new Response(body));
+
+      const events = await collect(new OllamaLlmProvider({}, fetchMock));
+
+      expect(events.map((event) => event.type)).toEqual(['delta', 'end']);
+    });
+
+    it('fails when the stream ends before the last message', async () => {
+      const fetchMock = createFetchReturning(
+        createNdjsonResponse([piece('Half')]),
+      );
+
+      await expect(
+        collect(new OllamaLlmProvider({}, fetchMock)),
+      ).rejects.toThrow('ended before the answer was complete');
+    });
+
+    it('rejects a line that is not valid JSON without repeating it', async () => {
+      const fetchMock = createFetchReturning(
+        new Response('secret prompt echo\n'),
+      );
+
+      await expect(
+        collect(new OllamaLlmProvider({}, fetchMock)),
+      ).rejects.toThrow(/^(?!.*secret)/);
+    });
+
+    it('rejects an error line without repeating its text', async () => {
+      const fetchMock = createFetchReturning(
+        createNdjsonResponse([{ error: 'model says secret prompt echo' }]),
+      );
+
+      await expect(
+        collect(new OllamaLlmProvider({}, fetchMock)),
+      ).rejects.toThrow('unexpected format');
+    });
+
+    it('stops reading a stream that grows beyond the size limit', async () => {
+      const bigPiece = piece('a'.repeat(MAX_RESPONSE_BODY_IN_BYTES));
+      const fetchMock = createFetchReturning(
+        createNdjsonResponse([bigPiece, last]),
+      );
+
+      await expect(
+        collect(new OllamaLlmProvider({}, fetchMock)),
+      ).rejects.toThrow('larger than allowed');
+    });
+
+    it('reports only the status of a failed request', async () => {
+      const fetchMock = createFetchReturning(
+        new Response('secret prompt echo', { status: 500 }),
+      );
+
+      await expect(
+        collect(new OllamaLlmProvider({}, fetchMock)),
+      ).rejects.toThrow('status 500');
+    });
+
+    it('closes the connection when the caller stops early', async () => {
+      let wasCancelled = false;
+      const encoder = new TextEncoder();
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(
+            encoder.encode(JSON.stringify(piece('One ')) + '\n'),
+          );
+        },
+        cancel() {
+          wasCancelled = true;
+        },
+      });
+      const fetchMock = createFetchReturning(new Response(body));
+
+      const events = new OllamaLlmProvider({}, fetchMock).stream(
+        createRequest(),
+      );
+      await events.next();
+      await events.return(undefined);
+
+      expect(wasCancelled).toBe(true);
+    });
+
+    it('validates the request before any network call', async () => {
+      const fetchMock = createFetchReturning(createNdjsonResponse([last]));
+      const provider = new OllamaLlmProvider({}, fetchMock);
+
+      await expect(
+        provider.stream({ ...createRequest(), userMessage: ' ' }).next(),
+      ).rejects.toThrow(RangeError);
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+  });
 });
