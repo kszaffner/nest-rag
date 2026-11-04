@@ -4,6 +4,7 @@ import { AppController } from './app.controller.js';
 import { AppService } from './app.service.js';
 import { DocumentsModule } from './documents/documents.module.js';
 import { EmbeddingsModule } from './embeddings/embeddings.module.js';
+import { IndexingModule } from './indexing/indexing.module.js';
 
 @Module({
   imports: [
@@ -12,6 +13,7 @@ import { EmbeddingsModule } from './embeddings/embeddings.module.js';
     }),
     DocumentsModule,
     EmbeddingsModule,
+    IndexingModule,
   ],
   controllers: [AppController],
   providers: [AppService],
