@@ -2,6 +2,7 @@ import { Inject, Injectable, Logger } from '@nestjs/common';
 import type { DocumentChunk } from '../documents/document.types.js';
 import { DocumentsService } from '../documents/documents.service.js';
 import { MAX_TEXTS_PER_BATCH } from '../embeddings/embedding-input-limits.js';
+import { findInjectionSignalPositions } from '../llm/prompt-injection-signals.js';
 import {
   EMBEDDING_PROVIDER,
   type EmbeddingProvider,
@@ -12,6 +13,9 @@ import {
   type StoredChunk,
   type VectorStore,
 } from '../vector-store/vector-store.interface.js';
+
+/** Keeps one log line short even when many chunks are flagged. */
+const MAX_LISTED_FLAGGED_CHUNKS = 10;
 
 export interface IndexingReport {
   documentCount: number;
@@ -54,6 +58,8 @@ export class IndexingService {
       );
     }
 
+    this.warnAboutInjectionSignals(chunks);
+
     const entries = await this.embedChunks(chunks);
     await this.vectorStore.replaceAll(entries);
 
@@ -64,6 +70,28 @@ export class IndexingService {
       `Indexed ${documents.length} documents as ${chunks.length} chunks`,
     );
     return { documentCount: documents.length, chunkCount: chunks.length };
+  }
+
+  /**
+   * Logs which chunks contain phrases typical for prompt injection, so an
+   * operator can review those documents. The chunks are still indexed and
+   * nothing from their text is logged, only their ids.
+   */
+  private warnAboutInjectionSignals(chunks: DocumentChunk[]): void {
+    const flaggedChunks = findInjectionSignalPositions(
+      chunks.map((chunk) => chunk.text),
+    ).map((position) => chunks[position]!);
+    if (flaggedChunks.length === 0) {
+      return;
+    }
+
+    const listedChunkIds = flaggedChunks
+      .slice(0, MAX_LISTED_FLAGGED_CHUNKS)
+      .map((chunk) => `${chunk.documentId}#${chunk.index}`)
+      .join(', ');
+    this.logger.warn(
+      `${flaggedChunks.length} chunk(s) contain phrases typical for prompt injection, review these documents (first ${MAX_LISTED_FLAGGED_CHUNKS}): ${listedChunkIds}`,
+    );
   }
 
   /** Embeds chunks in batches that respect the embedding provider limit. */
