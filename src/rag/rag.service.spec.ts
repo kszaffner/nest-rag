@@ -12,7 +12,11 @@ import type {
 import { MockLlmProvider } from '../llm/mock-llm.provider.js';
 import { InMemoryVectorStore } from '../vector-store/in-memory-vector-store.js';
 import { NO_ANSWER_TEXT, RAG_SYSTEM_PROMPT } from './rag-prompt.js';
-import { RETRIEVED_CHUNK_COUNT, RagService } from './rag.service.js';
+import {
+  RETRIEVED_CHUNK_COUNT,
+  RagService,
+  type RagStreamEvent,
+} from './rag.service.js';
 
 const SAMPLE_DOCUMENTS_DIRECTORY = join(process.cwd(), 'data', 'documents');
 
@@ -162,5 +166,76 @@ describe('RagService', () => {
     await expect(
       ragService.answerQuestion('Where is the office?'),
     ).rejects.toThrow('LLM request failed');
+  });
+});
+
+describe('RagService.streamAnswer', () => {
+  async function collectEvents(events: AsyncIterable<RagStreamEvent>) {
+    const collected: RagStreamEvent[] = [];
+    for await (const event of events) {
+      collected.push(event);
+    }
+    return collected;
+  }
+
+  it('sends the sources first, then the answer pieces, then the totals', async () => {
+    const { ragService } = await createFixture();
+
+    const events = await collectEvents(
+      ragService.streamAnswer('Where is the office?'),
+    );
+
+    expect(events[0]?.type).toBe('sources');
+    expect(events.at(-1)?.type).toBe('done');
+    const text = events
+      .map((event) => (event.type === 'delta' ? event.text : ''))
+      .join('');
+    const complete = await ragService.answerQuestion('Where is the office?');
+    expect(text).toBe(complete.answer);
+  });
+
+  it('adds the estimated cost to the last event', async () => {
+    const { llmProvider } = createRecordingLlm();
+    const { ragService } = await createFixture(llmProvider);
+
+    const events = await collectEvents(
+      ragService.streamAnswer('Where is the office?'),
+    );
+
+    expect(events.at(-1)).toEqual({
+      type: 'done',
+      model: 'claude-haiku-5-5',
+      usage: { inputTokens: 1_000, outputTokens: 100 },
+      estimatedCostInUsd: expect.closeTo(0.00015, 10),
+      wasTruncated: false,
+    });
+  });
+
+  it('does not call the model when nothing was found', async () => {
+    const { llmProvider } = createRecordingLlm();
+    const { ragService } = await createFixture(llmProvider, {
+      indexDocuments: false,
+    });
+
+    const events = await collectEvents(
+      ragService.streamAnswer('Where is the office?'),
+    );
+
+    expect(llmProvider.generate).not.toHaveBeenCalled();
+    expect(events.map((event) => event.type)).toEqual([
+      'sources',
+      'delta',
+      'done',
+    ]);
+  });
+
+  it('rejects an invalid question before any work', async () => {
+    const { llmProvider } = createRecordingLlm();
+    const { ragService } = await createFixture(llmProvider);
+
+    await expect(collectEvents(ragService.streamAnswer('   '))).rejects.toThrow(
+      RangeError,
+    );
+    expect(llmProvider.generate).not.toHaveBeenCalled();
   });
 });

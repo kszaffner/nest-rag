@@ -108,4 +108,85 @@ describe('POST /rag/query (e2e)', () => {
     expect(Number(response.headers['retry-after'])).toBeGreaterThan(0);
     expect(generate).toHaveBeenCalledTimes(MAX_REQUESTS_PER_WINDOW);
   });
+
+  describe('POST /rag/query/stream', () => {
+    /** supertest does not read text/event-stream by itself, so collect the text. */
+    function postStream(body: unknown) {
+      return request(app.getHttpServer())
+        .post('/rag/query/stream')
+        .buffer(true)
+        .parse((response, callback) => {
+          let text = '';
+          response.on('data', (chunk: Buffer) => (text += chunk.toString()));
+          response.on('end', () => callback(null, text));
+        })
+        .send(body as object);
+    }
+
+    function parseEvents(text: string) {
+      return text
+        .split('\n\n')
+        .filter((block) => block.length > 0)
+        .map((block) => {
+          const [eventLine = '', dataLine = ''] = block.split('\n');
+          return {
+            type: eventLine.replace('event: ', ''),
+            data: JSON.parse(dataLine.replace('data: ', '')),
+          };
+        });
+    }
+
+    it('streams sources, answer pieces and the totals', async () => {
+      const response = await postStream({ question: 'Where is the office?' });
+
+      expect(response.status).toBe(200);
+      expect(response.headers['content-type']).toContain('text/event-stream');
+      expect(response.headers['cache-control']).toBe('no-store');
+      const events = parseEvents(response.body as string);
+      expect(events[0]?.type).toBe('sources');
+      expect(events[0]?.data.sources.length).toBeGreaterThan(0);
+      expect(events.at(-1)?.type).toBe('done');
+      expect(events.at(-1)?.data.estimatedCostInUsd).toBeGreaterThan(0);
+      expect(
+        events
+          .filter((event) => event.type === 'delta')
+          .map((event) => event.data.text)
+          .join(''),
+      ).toBe('Lisbon.');
+    });
+
+    it('rejects an invalid body with 400 before any stream starts', async () => {
+      const response = await postStream({ question: 42 });
+
+      expect(response.status).toBe(400);
+      expect(generate).not.toHaveBeenCalled();
+    });
+
+    it('reports a model failure as an error event with a fixed text', async () => {
+      generate.mockRejectedValue(new Error(`bad key ${PROVIDER_SECRET}`));
+
+      const response = await postStream({ question: 'Where is the office?' });
+      const text = JSON.stringify(response.body);
+
+      // The sources are found first, so the failure comes after the stream
+      // has started: it is reported as an "error" event with a fixed text.
+      expect(text).not.toContain(PROVIDER_SECRET);
+      expect(response.status).toBe(200);
+      const events = parseEvents(response.body as string);
+      expect(events.at(-1)).toEqual({
+        type: 'error',
+        data: { message: 'The answer could not be generated' },
+      });
+    });
+
+    it('shares the request limit with the normal endpoint', async () => {
+      for (let count = 0; count < MAX_REQUESTS_PER_WINDOW; count += 1) {
+        await postStream({ question: 'Where is the office?' });
+      }
+
+      const response = await postStream({ question: 'Where is the office?' });
+
+      expect(response.status).toBe(429);
+    });
+  });
 });

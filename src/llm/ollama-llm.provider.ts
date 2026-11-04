@@ -4,6 +4,7 @@ import type {
   LlmGenerationRequest,
   LlmProvider,
   LlmResponse,
+  LlmStreamEvent,
 } from './llm-provider.interface.js';
 
 export const DEFAULT_OLLAMA_BASE_URL = 'http://localhost:11434';
@@ -39,6 +40,8 @@ const LOCAL_HOSTNAMES = ['localhost', '127.0.0.1', '[::1]'];
 export const MAX_RESPONSE_BODY_IN_BYTES = 1_048_576;
 
 const RESPONSE_TOO_LARGE_MESSAGE = 'Ollama response is larger than allowed';
+const UNEXPECTED_FORMAT_MESSAGE =
+  'Ollama returned a response in an unexpected format';
 
 export interface OllamaLlmOptions {
   /**
@@ -96,11 +99,78 @@ export class OllamaLlmProvider implements LlmProvider {
   }
 
   async generate(request: LlmGenerationRequest): Promise<LlmResponse> {
+    const response = await this.postChat(request, false);
+    return this.toLlmResponse(await readLimitedJson(response));
+  }
+
+  /**
+   * Streams the answer as Ollama writes it. Ollama sends one JSON object per
+   * line (NDJSON). The size limit applies to the whole stream, and the
+   * connection to Ollama is closed as soon as the caller stops reading (for
+   * example when the user closes the page), so the model stops working.
+   */
+  async *stream(request: LlmGenerationRequest): AsyncGenerator<LlmStreamEvent> {
+    const response = await this.postChat(request, true);
+    if (!response.body) {
+      throw new Error(UNEXPECTED_FORMAT_MESSAGE);
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let receivedBytes = 0;
+    let unfinishedLine = '';
+    let hasFinished = false;
+
+    try {
+      for (;;) {
+        const chunk = await reader.read();
+        if (chunk.done) {
+          break;
+        }
+        receivedBytes += chunk.value.byteLength;
+        if (receivedBytes > MAX_RESPONSE_BODY_IN_BYTES) {
+          throw new Error(RESPONSE_TOO_LARGE_MESSAGE);
+        }
+
+        const lines = (
+          unfinishedLine + decoder.decode(chunk.value, { stream: true })
+        ).split('\n');
+        unfinishedLine = lines.pop() ?? '';
+        for (const line of lines) {
+          const event = this.toStreamEvent(line);
+          if (event) {
+            yield event;
+            hasFinished = event.type === 'end';
+          }
+        }
+      }
+      if (unfinishedLine.trim().length > 0) {
+        const event = this.toStreamEvent(unfinishedLine);
+        if (event) {
+          yield event;
+          hasFinished = event.type === 'end';
+        }
+      }
+    } finally {
+      // Closes the connection to Ollama, also when the caller stopped early.
+      await reader.cancel().catch(() => undefined);
+    }
+
+    if (!hasFinished) {
+      throw new Error('Ollama stream ended before the answer was complete');
+    }
+  }
+
+  /** Sends the chat request. Shared by `generate` and `stream`. */
+  private async postChat(
+    request: LlmGenerationRequest,
+    shouldStream: boolean,
+  ): Promise<Response> {
     assertValidGenerationRequest(request);
 
     const requestBody = {
       model: this.options.model,
-      stream: false,
+      stream: shouldStream,
       // Thinking models (for example qwen3) would otherwise spend tokens on
       // a hidden chain of thought before the answer.
       think: false,
@@ -120,6 +190,7 @@ export class OllamaLlmProvider implements LlmProvider {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(requestBody),
+        // Covers the whole call, also the time spent reading a stream.
         signal: AbortSignal.timeout(this.options.requestTimeoutInMilliseconds),
         // A redirect could send the prompt to a server nobody configured.
         redirect: 'error',
@@ -132,14 +203,46 @@ export class OllamaLlmProvider implements LlmProvider {
       // Only the status: the body may echo parts of the prompt.
       throw new Error(`Ollama request failed with status ${response.status}`);
     }
+    return response;
+  }
 
-    return this.toLlmResponse(await readLimitedJson(response));
+  /** One line of the stream: a piece of text, the end, or nothing to report. */
+  private toStreamEvent(line: string): LlmStreamEvent | undefined {
+    if (line.trim().length === 0) {
+      return undefined;
+    }
+    let payload: unknown;
+    try {
+      payload = JSON.parse(line);
+    } catch (error) {
+      throw new Error(UNEXPECTED_FORMAT_MESSAGE, { cause: error });
+    }
+
+    if (isRecord(payload) && payload.done === true) {
+      return {
+        type: 'end',
+        model: readString(payload, 'model') ?? this.options.model,
+        usage: {
+          inputTokens: readCount(payload, 'prompt_eval_count'),
+          outputTokens: readCount(payload, 'eval_count'),
+        },
+        wasTruncated: readString(payload, 'done_reason') === STOP_REASON_LENGTH,
+      };
+    }
+
+    // A line with an "error" field has no message, so it ends up here too.
+    // Its text is not repeated, it could echo the prompt.
+    const text = readAnswerText(payload);
+    if (text === undefined) {
+      throw new Error(UNEXPECTED_FORMAT_MESSAGE);
+    }
+    return text.length > 0 ? { type: 'delta', text } : undefined;
   }
 
   private toLlmResponse(payload: unknown): LlmResponse {
     const answerText = readAnswerText(payload);
     if (answerText === undefined) {
-      throw new Error('Ollama returned a response in an unexpected format');
+      throw new Error(UNEXPECTED_FORMAT_MESSAGE);
     }
 
     return {
@@ -203,7 +306,7 @@ async function readLimitedJson(response: Response): Promise<unknown> {
   try {
     return JSON.parse(Buffer.concat(receivedChunks).toString('utf-8'));
   } catch (error) {
-    throw new Error('Ollama returned a response in an unexpected format', {
+    throw new Error(UNEXPECTED_FORMAT_MESSAGE, {
       cause: error,
     });
   }

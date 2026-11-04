@@ -4,6 +4,7 @@ import type {
   LlmGenerationRequest,
   LlmProvider,
   LlmResponse,
+  LlmStreamEvent,
 } from './llm-provider.interface.js';
 
 export const MOCK_MODEL_NAME = 'mock';
@@ -29,6 +30,20 @@ export class MockLlmProvider implements LlmProvider {
 
     return {
       text: this.createAnswer(request),
+      model: MOCK_MODEL_NAME,
+      usage: { inputTokens: NO_TOKENS_USED, outputTokens: NO_TOKENS_USED },
+    };
+  }
+
+  /** Streams the same answer word by word, to try the streaming without a model. */
+  async *stream(request: LlmGenerationRequest): AsyncGenerator<LlmStreamEvent> {
+    assertValidGenerationRequest(request);
+
+    for (const word of this.createAnswer(request).match(/\S+\s*/g) ?? []) {
+      yield { type: 'delta', text: word };
+    }
+    yield {
+      type: 'end',
       model: MOCK_MODEL_NAME,
       usage: { inputTokens: NO_TOKENS_USED, outputTokens: NO_TOKENS_USED },
     };
