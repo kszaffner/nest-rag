@@ -7,6 +7,7 @@ import {
   EMBEDDING_PROVIDER,
   type EmbeddingProvider,
 } from '../embeddings/embedding-provider.interface.js';
+import { createIndexFingerprint } from './index-fingerprint.js';
 import { MAX_STORED_CHUNKS } from '../vector-store/vector-store-limits.js';
 import {
   VECTOR_STORE,
@@ -20,11 +21,15 @@ const MAX_LISTED_FLAGGED_CHUNKS = 10;
 export interface IndexingReport {
   documentCount: number;
   chunkCount: number;
+  /** True when a persistent store was already up to date and nothing was embedded. */
+  reusedStoredIndex: boolean;
 }
 
 /**
  * Builds the search index: reads the documents, splits them into chunks,
  * converts every chunk into an embedding and stores both in the vector store.
+ * With a persistent store (SQLite) the embedding step is skipped when the
+ * stored index was built from the same chunks and the same embedding model.
  */
 @Injectable()
 export class IndexingService {
@@ -60,8 +65,24 @@ export class IndexingService {
 
     this.warnAboutInjectionSignals(chunks);
 
+    const indexFingerprint = createIndexFingerprint({
+      embeddingIdentity: this.embeddingProvider.identity,
+      dimensions: this.embeddingProvider.dimensions,
+      chunks,
+    });
+    if (await this.isStoredIndexUpToDate(indexFingerprint, chunks.length)) {
+      this.logger.log(
+        `Index is up to date, reusing ${chunks.length} stored chunks from ${documents.length} documents`,
+      );
+      return {
+        documentCount: documents.length,
+        chunkCount: chunks.length,
+        reusedStoredIndex: true,
+      };
+    }
+
     const entries = await this.embedChunks(chunks);
-    await this.vectorStore.replaceAll(entries);
+    await this.vectorStore.replaceAll(entries, { indexFingerprint });
 
     if (documents.length === 0) {
       this.logger.warn('No documents found, the index is now empty');
@@ -69,7 +90,30 @@ export class IndexingService {
     this.logger.log(
       `Indexed ${documents.length} documents as ${chunks.length} chunks`,
     );
-    return { documentCount: documents.length, chunkCount: chunks.length };
+    return {
+      documentCount: documents.length,
+      chunkCount: chunks.length,
+      reusedStoredIndex: false,
+    };
+  }
+
+  /**
+   * True when a persistent store already holds an index built from exactly
+   * these chunks and this embedding model. The chunk count is checked too, so
+   * a store that lost rows is rebuilt instead of trusted.
+   */
+  private async isStoredIndexUpToDate(
+    indexFingerprint: string,
+    expectedChunkCount: number,
+  ): Promise<boolean> {
+    if (!this.vectorStore.readIndexFingerprint) {
+      return false;
+    }
+    const storedFingerprint = await this.vectorStore.readIndexFingerprint();
+    return (
+      storedFingerprint === indexFingerprint &&
+      (await this.vectorStore.count()) === expectedChunkCount
+    );
   }
 
   /**

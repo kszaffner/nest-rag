@@ -107,6 +107,7 @@ export const createTransformersFeatureExtractor: FeatureExtractorFactory =
  */
 export class TransformersEmbeddingProvider implements EmbeddingProvider {
   readonly dimensions: number;
+  readonly identity: string;
 
   private readonly options: TransformersEmbeddingOptions;
   private readonly createFeatureExtractor: FeatureExtractorFactory;
@@ -124,6 +125,7 @@ export class TransformersEmbeddingProvider implements EmbeddingProvider {
       ...options,
     };
     this.dimensions = this.options.dimensions;
+    this.identity = `${this.options.modelName}@${this.options.modelRevision ?? 'unpinned'}`;
     this.createFeatureExtractor = createFeatureExtractor;
   }
 

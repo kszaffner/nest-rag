@@ -30,6 +30,12 @@ npm-debug.log*
 !.vscode/launch.json
 !.vscode/extensions.json
 
+# local SQLite index (built from the documents, can contain their text)
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+
 # local embedding model cache (downloaded by @xenova/transformers)
 .cache/
 

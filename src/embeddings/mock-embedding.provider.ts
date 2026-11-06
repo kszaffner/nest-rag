@@ -27,6 +27,8 @@ const EMPTY_VECTOR_LENGTH = 0;
 @Injectable()
 export class MockEmbeddingProvider implements EmbeddingProvider {
   readonly dimensions = MOCK_EMBEDDING_DIMENSIONS;
+  /** Change the version when the hashing in createEmbedding changes. */
+  readonly identity = 'mock-word-hash-v1';
 
   async embed(text: string): Promise<Embedding> {
     assertValidEmbeddingText(text);
