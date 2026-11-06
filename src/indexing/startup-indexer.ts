@@ -13,11 +13,10 @@ import { IndexingService } from './indexing.service.js';
  * start (fail fast): an application without an index would answer every
  * question with "I could not find this in the documents".
  *
- * Future SQLite migration: the in-memory store forgets everything on
- * restart, which is why the whole index is rebuilt here on every start. With
- * a persistent store (SQLite + sqlite-vec) the index survives restarts, so
- * this class should then index only new or changed documents, or move to an
- * explicit "reindex" command.
+ * The in-memory store forgets everything on restart, so the index is rebuilt
+ * on every start. With the SQLite store, IndexingService reuses the saved
+ * index when the documents and the embedding model did not change, and
+ * rebuilds it (atomically) when they did.
  */
 @Injectable()
 export class StartupIndexer implements OnApplicationBootstrap {

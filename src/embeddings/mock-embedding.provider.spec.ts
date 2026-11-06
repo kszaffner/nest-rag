@@ -19,6 +19,10 @@ function dotProduct(first: Embedding, second: Embedding): number {
 describe('MockEmbeddingProvider', () => {
   const provider = new MockEmbeddingProvider();
 
+  it('has a versioned identity', () => {
+    expect(provider.identity).toBe('mock-word-hash-v1');
+  });
+
   it('returns a vector with the declared number of dimensions', async () => {
     const embedding = await provider.embed('How many vacation days do I have?');
 

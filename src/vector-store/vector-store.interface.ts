@@ -24,6 +24,15 @@ export interface SearchResult {
   similarity: number;
 }
 
+export interface ReplaceAllOptions {
+  /**
+   * Describes what the content was built from (documents, chunking, embedding
+   * model). A persistent store saves it in the same transaction as the chunks;
+   * a store that forgets everything on restart ignores it.
+   */
+  indexFingerprint?: string;
+}
+
 export interface VectorStore {
   /** Adds chunks, or replaces chunks that were stored under the same id. */
   upsert(entries: readonly StoredChunk[]): Promise<void>;
@@ -33,7 +42,17 @@ export interface VectorStore {
    * when anything is invalid, the previous content stays untouched. Use it to
    * rebuild an index, so chunks of removed or shortened documents disappear.
    */
-  replaceAll(entries: readonly StoredChunk[]): Promise<void>;
+  replaceAll(
+    entries: readonly StoredChunk[],
+    options?: ReplaceAllOptions,
+  ): Promise<void>;
+
+  /**
+   * Only for stores that survive a restart: the fingerprint saved by the last
+   * replaceAll, or undefined when there is none. Lets the application skip
+   * rebuilding an index that is already up to date.
+   */
+  readIndexFingerprint?(): Promise<string | undefined>;
 
   /** Returns the most similar chunks, the most similar first. */
   search(

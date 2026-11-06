@@ -6,8 +6,13 @@ import { vi } from 'vitest';
 import type { DocumentChunk } from '../documents/document.types.js';
 import { DocumentsService } from '../documents/documents.service.js';
 import { MAX_TEXTS_PER_BATCH } from '../embeddings/embedding-input-limits.js';
+import type { EmbeddingProvider } from '../embeddings/embedding-provider.interface.js';
 import { MockEmbeddingProvider } from '../embeddings/mock-embedding.provider.js';
 import { InMemoryVectorStore } from '../vector-store/in-memory-vector-store.js';
+import {
+  IN_MEMORY_DATABASE_PATH,
+  SqliteVectorStore,
+} from '../vector-store/sqlite-vector-store.js';
 import { MAX_STORED_CHUNKS } from '../vector-store/vector-store-limits.js';
 import { IndexingService } from './indexing.service.js';
 
@@ -213,10 +218,131 @@ describe('IndexingService', () => {
     try {
       const report = await indexingService.indexDirectory(emptyDirectory);
 
-      expect(report).toEqual({ documentCount: 0, chunkCount: 0 });
+      expect(report).toEqual({
+        documentCount: 0,
+        chunkCount: 0,
+        reusedStoredIndex: false,
+      });
       await expect(vectorStore.count()).resolves.toBe(0);
     } finally {
       await rm(emptyDirectory, { recursive: true });
     }
+  });
+
+  describe('with a persistent store', () => {
+    function createPersistentFixture(chunks = createChunks(3)) {
+      const embeddingProvider = new MockEmbeddingProvider();
+      const vectorStore = new SqliteVectorStore({
+        databasePath: IN_MEMORY_DATABASE_PATH,
+        dimensions: embeddingProvider.dimensions,
+      });
+      const createService = (
+        provider: EmbeddingProvider = embeddingProvider,
+        currentChunks = chunks,
+      ) =>
+        new IndexingService(
+          createDocumentsServiceReturning(currentChunks),
+          provider,
+          vectorStore,
+        );
+      return { embeddingProvider, vectorStore, createService };
+    }
+
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it('does not embed again when nothing changed', async () => {
+      const { embeddingProvider, createService } = createPersistentFixture();
+      await createService().indexDirectory(SAMPLE_DOCUMENTS_DIRECTORY);
+      const embedManySpy = vi.spyOn(embeddingProvider, 'embedMany');
+
+      const report = await createService().indexDirectory(
+        SAMPLE_DOCUMENTS_DIRECTORY,
+      );
+
+      expect(report).toEqual({
+        documentCount: 1,
+        chunkCount: 3,
+        reusedStoredIndex: true,
+      });
+      expect(embedManySpy).not.toHaveBeenCalled();
+    });
+
+    it('keeps the reused index searchable', async () => {
+      const { embeddingProvider, vectorStore, createService } =
+        createPersistentFixture();
+      await createService().indexDirectory(SAMPLE_DOCUMENTS_DIRECTORY);
+      await createService().indexDirectory(SAMPLE_DOCUMENTS_DIRECTORY);
+
+      const results = await vectorStore.search(
+        await embeddingProvider.embed('generated chunk number 1'),
+        { topK: 1 },
+      );
+
+      expect(results[0]!.chunk.index).toBe(1);
+    });
+
+    it('embeds again when a chunk text changed', async () => {
+      const { embeddingProvider, createService } = createPersistentFixture();
+      await createService().indexDirectory(SAMPLE_DOCUMENTS_DIRECTORY);
+      const embedManySpy = vi.spyOn(embeddingProvider, 'embedMany');
+      const changedChunks = createChunks(3);
+      changedChunks[1] = { ...changedChunks[1]!, text: 'edited policy text' };
+
+      const report = await createService(
+        embeddingProvider,
+        changedChunks,
+      ).indexDirectory(SAMPLE_DOCUMENTS_DIRECTORY);
+
+      expect(report.reusedStoredIndex).toBe(false);
+      expect(embedManySpy).toHaveBeenCalledOnce();
+    });
+
+    it('embeds again when the embedding model changed', async () => {
+      const { embeddingProvider, createService } = createPersistentFixture();
+      await createService().indexDirectory(SAMPLE_DOCUMENTS_DIRECTORY);
+      const upgradedModel = Object.create(embeddingProvider, {
+        identity: { value: 'another-model@2' },
+      }) as EmbeddingProvider;
+      const embedManySpy = vi.spyOn(embeddingProvider, 'embedMany');
+
+      const report = await createService(upgradedModel).indexDirectory(
+        SAMPLE_DOCUMENTS_DIRECTORY,
+      );
+
+      expect(report.reusedStoredIndex).toBe(false);
+      expect(embedManySpy).toHaveBeenCalledOnce();
+    });
+
+    it('rebuilds an index whose stored content was changed afterwards', async () => {
+      const { embeddingProvider, vectorStore, createService } =
+        createPersistentFixture();
+      await createService().indexDirectory(SAMPLE_DOCUMENTS_DIRECTORY);
+      await vectorStore.upsert([
+        {
+          chunk: { documentId: 'extra', index: 0, text: 'extra' },
+          embedding: await embeddingProvider.embed('extra'),
+        },
+      ]);
+
+      const report = await createService().indexDirectory(
+        SAMPLE_DOCUMENTS_DIRECTORY,
+      );
+
+      expect(report.reusedStoredIndex).toBe(false);
+      await expect(vectorStore.count()).resolves.toBe(3);
+    });
+
+    it('never reuses anything with the in-memory store', async () => {
+      const { indexingService } = createFixture();
+      await indexingService.indexDirectory(SAMPLE_DOCUMENTS_DIRECTORY);
+
+      const report = await indexingService.indexDirectory(
+        SAMPLE_DOCUMENTS_DIRECTORY,
+      );
+
+      expect(report.reusedStoredIndex).toBe(false);
+    });
   });
 });

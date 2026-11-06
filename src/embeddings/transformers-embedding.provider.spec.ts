@@ -35,6 +35,21 @@ function createProvider(factory: FeatureExtractorFactory) {
 }
 
 describe('TransformersEmbeddingProvider', () => {
+  it('names the model and the pinned revision as its identity', () => {
+    const { factory } = createFakeFactory();
+
+    expect(
+      new TransformersEmbeddingProvider(
+        { modelName: 'org/model', modelRevision: 'abc123' },
+        factory,
+      ).identity,
+    ).toBe('org/model@abc123');
+    expect(
+      new TransformersEmbeddingProvider({ modelName: 'org/model' }, factory)
+        .identity,
+    ).toBe('org/model@unpinned');
+  });
+
   it('does not load the model until the first use', async () => {
     const { factory, loadCount } = createFakeFactory();
     const provider = createProvider(factory);

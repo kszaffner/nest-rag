@@ -1,6 +1,6 @@
 import type { Embedding } from '../embeddings/embedding-provider.interface.js';
 import { createChunkId } from './chunk-id.js';
-import { dotProduct, hasUnitOrZeroLength } from './vector-math.js';
+import { assertValidEmbedding, dotProduct } from './vector-math.js';
 import {
   MAX_STORED_CHUNKS,
   resolveSearchOptions,
@@ -29,12 +29,7 @@ interface SearchCandidate extends SearchResult {
  * Keeps chunks and embeddings in memory and finds the most similar ones by
  * comparing the query with every stored embedding. Simple and exact, and
  * fast enough for thousands of chunks. Everything is lost when the application
- * stops. Replace it with a database-backed VectorStore for larger data.
- *
- * Planned migration: a SQLite store (with the sqlite-vec extension) that
- * implements the same VectorStore interface. Only the factory in
- * VectorStoreModule changes; see also StartupIndexer, which rebuilds the
- * index on every start only because this store is not persistent.
+ * stops. Use SqliteVectorStore when the index should survive a restart.
  */
 export class InMemoryVectorStore implements VectorStore {
   private readonly dimensions: number;
@@ -149,14 +144,6 @@ export class InMemoryVectorStore implements VectorStore {
    * produce a wrong ranking, so they are rejected loudly.
    */
   private assertValidEmbedding(embedding: Embedding): void {
-    if (embedding.length !== this.dimensions) {
-      throw new RangeError(`Embedding must have ${this.dimensions} dimensions`);
-    }
-    if (!embedding.every((value) => Number.isFinite(value))) {
-      throw new RangeError('Embedding must contain only finite numbers');
-    }
-    if (!hasUnitOrZeroLength(embedding)) {
-      throw new RangeError('Embedding must be normalized to length 1');
-    }
+    assertValidEmbedding(embedding, this.dimensions);
   }
 }
